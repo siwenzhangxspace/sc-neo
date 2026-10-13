@@ -7,7 +7,11 @@ import argparse
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from scneo_utils import read_tsv, split_list, write_tsv
+from scneo_utils import read_tsv, write_tsv
+from candidate_utils import (
+    candidate_key, clean, consistent_row, evidence_index,
+    grouped_candidates, supporting_cells,
+)
 
 
 FINAL_FIELDS = [
@@ -15,8 +19,12 @@ FINAL_FIELDS = [
     "patient_status",
     "source_type",
     "gene",
-    "transcript_id",
     "variant_or_junction_id",
+    "var_key",
+    "HGVSp_Short",
+    "protein_change_status",
+    "n_original_rows",
+    "n_barcode",
     "variant_status",
     "variant_class",
     "Variant_Classification",
@@ -28,7 +36,11 @@ FINAL_FIELDS = [
     "bind_level",
     "IEDB_immunogenicity_score",
     "PCI_DB_enabled",
-    "healthy_exact_match",
+    "healthy_blast_match",
+    "healthy_match_peptide",
+    "healthy_blast_identity",
+    "healthy_blast_evalue",
+    "healthy_blast_alignment_length",
     "tumor_immune_peptide",
     "best_match_peptide",
     "blast_identity",
@@ -38,15 +50,9 @@ FINAL_FIELDS = [
     "best_cdr3_beta_aa",
     "RNA_expression_support",
     "expression_mapping_status",
-    "expression_supporting_cell_ids",
-    "expression_missing_cell_ids",
-    "supporting_tumor_cell_ids",
-    "normal_alt_cell_ids",
-    "normal_callable_cell_ids",
     "normal_evidence_status",
     "tumor_specific_candidate",
     "tumor_enriched_candidate",
-    "annotation_summary",
 ]
 
 
@@ -65,60 +71,61 @@ def main() -> None:
     parser.add_argument("--summary", required=True)
     args = parser.parse_args()
 
-    pmhc_rows = read_tsv(args.pmhc)
-    mutation_maf = (
-        {row.get("variant_key", ""): row for row in read_tsv(args.mutation_maf) if row.get("variant_key")}
-        if args.mutation_maf
-        else {}
-    )
+    groups = grouped_candidates(read_tsv(args.pmhc))
+    mutation_maf = index_maf(read_tsv(args.mutation_maf)) if args.mutation_maf else {}
     iedb = index_iedb(read_tsv(args.iedb))
     if args.immunopeptidome:
-        immunopeptidome = {
-            row.get("candidate_peptide", ""): row
-            for row in read_tsv(args.immunopeptidome)
-            if row.get("candidate_peptide")
-        }
+        immunopeptidome = evidence_index(
+            read_tsv(args.immunopeptidome), lambda row: clean(row.get("candidate_peptide")),
+            FINAL_FIELDS[FINAL_FIELDS.index("PCI_DB_enabled"):FINAL_FIELDS.index("max_TABR_BERT_rank")],
+        )
     elif args.pcidb:
         immunopeptidome = legacy_pcidb_evidence(read_tsv(args.pcidb))
     else:
         immunopeptidome = {}
-    tabr = {
-        tabr_key(row): row
-        for row in read_tsv(args.tabr)
-    }
+    tabr = evidence_index(read_tsv(args.tabr), tabr_key,
+                          ["max_TABR_BERT_rank", "best_tcr_cell_id", "best_cdr3_beta_aa"])
     expression = (
-        {candidate_key(row): row for row in read_tsv(args.expression)}
+        evidence_index(read_tsv(args.expression), candidate_key,
+                       ["RNA_expression_support", "expression_mapping_status"])
         if args.expression
         else {}
     )
     patient_status = (
-        {
-            row.get("patient_id", ""): row.get("patient_status", "")
-            for row in read_tsv(args.manifest_summary)
-        }
+        {key: row["patient_status"] for key, row in evidence_index(
+            read_tsv(args.manifest_summary), lambda row: clean(row.get("patient_id")),
+            ["patient_status"]).items()}
         if args.manifest_summary
         else {}
     )
 
     final_rows = []
-    seen = set()
-    for pmhc in pmhc_rows:
-        key = candidate_key(pmhc)
-        if key in seen:
-            continue
-        seen.add(key)
+    for key, group in groups.items():
+        enriched = []
+        for record in group:
+            annotation = match_maf(record, mutation_maf)
+            item = dict(record)
+            for field in ["variant_class", "variant_status", "Variant_Classification"]:
+                if not clean(item.get(field)):
+                    item[field] = annotation.get(field, "")
+            enriched.append(item)
+        pmhc = consistent_row(enriched, [
+            "patient_id", "source_type", "gene", "variant_or_junction_id", "var_key", "HGVSp_Short",
+            "protein_change_status", "peptide", "peptide_length", "hla_allele", "Aff.nM", "rank_el",
+            "bind_level", "variant_status", "variant_class", "Variant_Classification",
+            "normal_evidence_status", "tumor_specific_candidate", "tumor_enriched_candidate",
+        ], key)
         peptide = pmhc.get("peptide", "")
-        mutation_row = mutation_maf.get(pmhc.get("variant_or_junction_id", ""), {}) if pmhc.get("source_type") == "mutation" else {}
         legacy_status = (
-            mutation_row.get("variant_status")
-            or mutation_row.get("variant_class")
-            or pmhc.get("variant_status")
+            pmhc.get("variant_status")
             or pmhc.get("variant_class", "")
         )
         variant_status = "somatic_candidate" if legacy_status == "tumor_variant" else legacy_status
-        iedb_row = iedb.get(key) or iedb.get(("", "", "", peptide, "")) or {}
+        iedb_row = iedb.get(peptide, {})
         immune_row = immunopeptidome.get(peptide, {})
         tabr_row = tabr.get(tabr_key(pmhc), {})
+        if args.expression and key not in expression:
+            raise ValueError(f"Missing expression evidence row for key7 {key!r}; regenerate expression support")
         expression_row = expression.get(key, {})
 
         final_rows.append(
@@ -127,11 +134,15 @@ def main() -> None:
                 "patient_status": patient_status.get(pmhc.get("patient_id", ""), ""),
                 "source_type": pmhc.get("source_type", ""),
                 "gene": pmhc.get("gene", ""),
-                "transcript_id": pmhc.get("transcript_id", ""),
                 "variant_or_junction_id": pmhc.get("variant_or_junction_id", ""),
+                "var_key": pmhc["var_key"],
+                "HGVSp_Short": pmhc["HGVSp_Short"],
+                "protein_change_status": pmhc["protein_change_status"],
+                "n_original_rows": len(group),
+                "n_barcode": len(supporting_cells(group)),
                 "variant_status": pmhc.get("variant_status") or variant_status,
-                "variant_class": pmhc.get("variant_class") or mutation_row.get("variant_class", ""),
-                "Variant_Classification": pmhc.get("Variant_Classification") or mutation_row.get("Variant_Classification", ""),
+                "variant_class": pmhc.get("variant_class", ""),
+                "Variant_Classification": pmhc.get("Variant_Classification", ""),
                 "peptide_sequence": peptide,
                 "peptide_length": pmhc.get("peptide_length", len(peptide)),
                 "HLA_allele": pmhc.get("hla_allele", ""),
@@ -140,7 +151,11 @@ def main() -> None:
                 "bind_level": pmhc.get("bind_level", ""),
                 "IEDB_immunogenicity_score": iedb_row.get("immunogenicity_score", ""),
                 "PCI_DB_enabled": immune_row.get("PCI_DB_enabled", "false"),
-                "healthy_exact_match": immune_row.get("healthy_exact_match", "false"),
+                "healthy_blast_match": immune_row.get("healthy_blast_match", "false"),
+                "healthy_match_peptide": immune_row.get("healthy_match_peptide", ""),
+                "healthy_blast_identity": immune_row.get("healthy_blast_identity", ""),
+                "healthy_blast_evalue": immune_row.get("healthy_blast_evalue", ""),
+                "healthy_blast_alignment_length": immune_row.get("healthy_blast_alignment_length", ""),
                 "tumor_immune_peptide": immune_row.get("tumor_immune_peptide", ""),
                 "best_match_peptide": immune_row.get("best_match_peptide", ""),
                 "blast_identity": immune_row.get("blast_identity", ""),
@@ -150,15 +165,9 @@ def main() -> None:
                 "best_cdr3_beta_aa": tabr_row.get("best_cdr3_beta_aa", ""),
                 "RNA_expression_support": expression_row.get("RNA_expression_support", ""),
                 "expression_mapping_status": expression_row.get("expression_mapping_status", ""),
-                "expression_supporting_cell_ids": expression_row.get("expression_supporting_cell_ids", ""),
-                "expression_missing_cell_ids": expression_row.get("expression_missing_cell_ids", ""),
-                "supporting_tumor_cell_ids": pmhc.get("supporting_tumor_cell_ids", ""),
-                "normal_alt_cell_ids": pmhc.get("normal_alt_cell_ids", ""),
-                "normal_callable_cell_ids": pmhc.get("normal_callable_cell_ids", ""),
                 "normal_evidence_status": pmhc.get("normal_evidence_status", ""),
                 "tumor_specific_candidate": pmhc.get("tumor_specific_candidate", ""),
                 "tumor_enriched_candidate": pmhc.get("tumor_enriched_candidate", ""),
-                "annotation_summary": pmhc.get("annotation_summary", ""),
             }
         )
 
@@ -201,35 +210,52 @@ def main() -> None:
     )
 
 
-def candidate_key(row: dict[str, str]) -> tuple[str, str, str, str, str]:
-    return (
-        row.get("patient_id", ""),
-        row.get("source_type", ""),
-        row.get("variant_or_junction_id", ""),
-        row.get("peptide") or row.get("peptide_sequence", ""),
-        row.get("hla_allele") or row.get("HLA_allele", ""),
-    )
+def index_maf(rows):
+    groups = defaultdict(list)
+    for row in rows:
+        key = tuple(clean(value) for value in (
+            row.get("patient_id"), row.get("variant_key"),
+            row.get("Hugo_Symbol") or row.get("Gene") or row.get("SYMBOL"), row.get("HGVSp_Short"),
+        ))
+        groups[key].append(row)
+    return groups
+
+
+def match_maf(pmhc, index):
+    if pmhc["source_type"] != "mutation":
+        return {}
+    key = (pmhc["patient_id"], pmhc["var_key"], pmhc["gene"], pmhc["HGVSp_Short"])
+    rows = index.get(key, [])
+    tid = clean(pmhc.get("transcript_id"))
+    if tid:
+        exact = [row for row in rows if maf_transcript(row) == tid]
+        if exact:
+            rows = exact
+        else:
+            # Allow the existing unversioned peptide transcript only if unambiguous.
+            compatible = [row for row in rows if maf_transcript(row).split(".")[0] == tid.split(".")[0]
+                          and ("." not in tid or "." not in maf_transcript(row))]
+            if len({maf_transcript(row) for row in compatible}) > 1:
+                raise ValueError(f"Ambiguous MAF transcript for {key}: {tid}")
+            rows = compatible
+    return consistent_row(rows, ["variant_status", "variant_class", "Variant_Classification"], key)
+
+
+def maf_transcript(row):
+    return next((clean(row.get(field)) for field in ["Transcript_ID", "Feature", "transcript_id", "ENST"]
+                 if clean(row.get(field))), "")
 
 
 def tabr_key(row: dict[str, str]) -> tuple[str, str, str]:
     return (
-        row.get("patient_id", ""),
-        row.get("peptide") or row.get("peptide_sequence", ""),
-        row.get("hla_allele") or row.get("HLA_allele", ""),
+        clean(row.get("patient_id")),
+        clean(row.get("peptide") or row.get("peptide_sequence")),
+        clean(row.get("hla_allele") or row.get("HLA_allele")),
     )
 
 
-def index_iedb(rows: list[dict[str, str]]) -> dict[tuple[str, str, str, str, str], dict[str, str]]:
-    out = {}
-    peptide_fallback = {}
-    for row in rows:
-        if not row.get("peptide") or row.get("immunogenicity_score", "") == "":
-            continue
-        key = candidate_key(row)
-        out.setdefault(key, row)
-        peptide_fallback.setdefault(("", "", "", row["peptide"], ""), row)
-    out.update(peptide_fallback)
-    return out
+def index_iedb(rows):
+    return evidence_index(rows, lambda row: clean(row.get("peptide")), ["immunogenicity_score"])
 
 
 def legacy_pcidb_evidence(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
@@ -242,7 +268,7 @@ def legacy_pcidb_evidence(rows: list[dict[str, str]]) -> dict[str, dict[str, str
         candidate = {
             "candidate_peptide": peptide,
             "PCI_DB_enabled": "true",
-            "healthy_exact_match": "false",
+            "healthy_blast_match": "false",
             "tumor_immune_peptide": row.get("matched_pcidb_peptide", ""),
             "best_match_peptide": row.get("matched_pcidb_peptide", ""),
             "blast_identity": row.get("percent_identity", ""),

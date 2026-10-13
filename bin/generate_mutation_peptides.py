@@ -5,6 +5,13 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
+from collections import Counter
+from contextlib import ExitStack
+from pathlib import Path
+
+from reconstruct_frameshift import (RejectedVariant, base_id, is_frameshift, load_models,
+                                   reconstruct, transcript_id)
 
 from scneo_utils import parse_lengths, read_tsv, write_tsv
 
@@ -15,46 +22,89 @@ PEPTIDE_LENGTHS = [8, 9, 10, 11]
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--maf", required=True)
-    parser.add_argument("--protein-fasta", required=True)
+    parser.add_argument("--protein-fasta", help="Protein reference required for non-frameshift peptide generation")
     parser.add_argument("--lengths", default="8,9,10,11")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--genome-fasta")
+    parser.add_argument("--reference-gtf")
+    parser.add_argument("--rejected-out", required=True)
     args = parser.parse_args()
+    if bool(args.genome_fasta) != bool(args.reference_gtf):
+        parser.error("--genome-fasta and --reference-gtf must be supplied together")
+    with ExitStack() as stack:
+        generate(args, stack)
 
-    proteins = load_protein_sequences(args.protein_fasta)
+
+def generate(args, stack):
+
+    proteins = None
     lengths = parse_lengths(args.lengths)
     rows = []
-    seen = set()
-    for maf in read_tsv(args.maf):
+    rejected = []
+    successes = 0
+    maf_rows = read_tsv(args.maf)
+    fasta = None
+    models = {}
+    if args.genome_fasta:
+        import pysam
+        if not Path(args.genome_fasta + ".fai").is_file():
+            raise FileNotFoundError(args.genome_fasta + ".fai")
+        fasta = stack.enter_context(pysam.FastaFile(args.genome_fasta))
+        models = load_models(args.reference_gtf, {base_id(transcript_id(row)) for row in maf_rows if is_frameshift(row)})
+    for maf in maf_rows:
         consequence = maf.get("Consequence") or maf.get("Variant_Classification") or ""
-        if not coding_consequence(consequence):
+        fs = is_frameshift(maf)
+        if not fs and not coding_consequence(consequence):
             continue
         parsed = parse_hgvsp(maf.get("HGVSp_Short") or maf.get("HGVSp", ""))
-        if parsed is None or parsed.get("parse_error"):
+        if not fs and (parsed is None or parsed.get("parse_error")):
             continue
         gene = str(maf.get("Hugo_Symbol", "")).strip()
-        wild_type = proteins.get(gene, "")
-        if not wild_type:
-            wild_type = find_protein_sequence(proteins, transcript(maf), maf)
-        built = build_mutant_sequence(wild_type, parsed)
-        if built is None:
-            continue
-        mutant, start, end = built
-        stop_pos = None
-        if parsed["type"] == "FS" and parsed.get("count") is not None:
-            stop_pos = parsed["num1"] + parsed["count"]
-        peptides = sliding_window_peptides(mutant, start, end, lengths, stop_pos)
-        for peptide, length in peptides:
-            key = (maf.get("patient_id", ""), maf.get("variant_key", ""), gene, peptide)
-            if key in seen:
+        termination, resolved_tid = "", transcript_id(maf)
+        if fs:
+            try:
+                if fasta is None:
+                    raise RejectedVariant("missing_nucleotide_reference", "Supply --genome-fasta and --reference-gtf")
+                mutant, start, end, termination, resolved_tid = reconstruct(maf, models, fasta)
+            except RejectedVariant as exc:
+                rejected.append({"patient_id": maf.get("patient_id", ""), "variant_key": maf.get("variant_key", ""),
+                                 "transcript_id": transcript_id(maf), "HGVSc": maf.get("HGVSc", ""),
+                                 "HGVSp": maf.get("HGVSp_Short") or maf.get("HGVSp", ""),
+                                 "reason": exc.reason, "detail": str(exc)})
                 continue
-            seen.add(key)
-            rows.append(make_output_row(maf, consequence, peptide, length, start, parsed["type"]))
+            successes += 1
+            mutation_type = "FS"
+        else:
+            if proteins is None:
+                if not args.protein_fasta:
+                    raise ValueError("--protein-fasta is required for non-frameshift peptide generation")
+                proteins = load_protein_sequences(args.protein_fasta)
+            wild_type = proteins.get(gene, "") or find_protein_sequence(proteins, transcript(maf), maf)
+            built = build_mutant_sequence(wild_type, parsed)
+            if built is None:
+                continue
+            mutant, start, end = built
+            mutation_type = parsed["type"]
+        peptides = sliding_window_peptides(mutant, start, end, lengths) if start <= end else []
+        for peptide, length in peptides:
+            # Preserve annotation and cell evidence until patient-level key7 aggregation.
+            output = make_output_row(maf, consequence, peptide, length, start, mutation_type)
+            output["frameshift_translation_end"] = termination
+            if fs:
+                output["transcript_id"] = resolved_tid
+            rows.append(output)
+
+    write_tsv(args.rejected_out, rejected, ["patient_id", "variant_key", "transcript_id", "HGVSc", "HGVSp", "reason", "detail"])
+    print(f"Frameshift reconstructed={successes} rejected={len(rejected)} reasons={dict(Counter(row['reason'] for row in rejected))}", file=sys.stderr)
 
     fields = [
         "patient_id",
         "source_type",
         "variant_key",
         "variant_or_junction_id",
+        "HGVSp_Short",
+        "Variant_Classification",
+        "variant_status",
         "gene",
         "transcript_id",
         "consequence",
@@ -73,6 +123,7 @@ def main() -> None:
         "tumor_specific_candidate",
         "tumor_enriched_candidate",
         "annotation_summary",
+        "frameshift_translation_end",
     ]
     write_tsv(args.out, rows, fields)
 
@@ -212,7 +263,7 @@ def build_mutant_sequence(
         n1 = int(parsed["num1"])
         if n1 > length:
             return None
-        if mutation_type == "SNV" or mutation_type == "FS":
+        if mutation_type == "SNV":
             mutant = wild_type[: n1 - 1] + str(parsed["alt"]) + wild_type[n1:]
             return mutant, n1, n1
         n2 = int(parsed.get("num2") or n1)
@@ -309,6 +360,9 @@ def make_output_row(
         "source_type": "mutation",
         "variant_key": variant_key,
         "variant_or_junction_id": variant_key,
+        "HGVSp_Short": maf.get("HGVSp_Short", ""),
+        "Variant_Classification": maf.get("Variant_Classification", ""),
+        "variant_status": maf.get("variant_status", ""),
         "gene": maf.get("Hugo_Symbol") or maf.get("Gene") or maf.get("SYMBOL", ""),
         "transcript_id": transcript(maf),
         "consequence": consequence,

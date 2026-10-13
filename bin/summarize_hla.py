@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarize per-patient OptiType HLA calls into the patient-level allele table.
 
-Each patient is typed once from a merged tumor-cell FASTQ pool, so the per-patient
+Each patient is typed once from pooled tumor and matched adjacent non-tumor FASTQs, so the per-patient
 files already carry the final allele set. This script merges them into one table,
 keeps the coverage diagnostics (nof_reads/obj), and derives a completeness status:
 `ok` (6 alleles), `partial` (1-5), `no_hla` (no alleles), or `missing` (no file).

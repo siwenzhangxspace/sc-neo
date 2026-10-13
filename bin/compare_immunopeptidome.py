@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import shlex
 import subprocess
 import tempfile
@@ -18,7 +19,11 @@ EVIDENCE_FIELDS = [
     "candidate_peptide",
     "peptide_length",
     "PCI_DB_enabled",
-    "healthy_exact_match",
+    "healthy_blast_match",
+    "healthy_match_peptide",
+    "healthy_blast_identity",
+    "healthy_blast_evalue",
+    "healthy_blast_alignment_length",
     "tumor_immune_peptide",
     "best_match_peptide",
     "blast_identity",
@@ -74,28 +79,31 @@ def main() -> None:
     healthy = load_reference(args.healthy, lengths)
     tumor = load_reference(args.tumor, lengths)
 
-    healthy_exact = {
-        candidate
-        for candidate in candidates
-        if candidate in {row["peptide"] for row in healthy.get(len(candidate), [])}
-    }
-    retained = [candidate for candidate in candidates if candidate not in healthy_exact]
+    healthy_hits = blast_best_hits(candidates, healthy, args)
+    excluded = {candidate for candidate, hit in healthy_hits.items()
+                if float(hit["blast_identity"]) == 100.0}
+    retained = [candidate for candidate in candidates if candidate not in excluded]
     tumor_hits = blast_best_hits(retained, tumor, args)
 
     evidence = []
     for candidate in candidates:
-        if candidate in healthy_exact:
-            row = empty_evidence(candidate, enabled=True)
-            row["healthy_exact_match"] = "true"
-        else:
-            row = empty_evidence(candidate, enabled=True)
-            hit = tumor_hits.get(candidate)
-            if hit:
-                row.update(hit)
+        row = empty_evidence(candidate, enabled=True)
+        hit = tumor_hits.get(candidate)
+        if hit:
+            row.update(hit)
+        healthy_hit = healthy_hits.get(candidate)
+        if healthy_hit:
+            row.update({
+                "healthy_blast_match": "true" if candidate in excluded else "false",
+                "healthy_match_peptide": healthy_hit["tumor_immune_peptide"],
+                "healthy_blast_identity": healthy_hit["blast_identity"],
+                "healthy_blast_evalue": healthy_hit["blast_evalue"],
+                "healthy_blast_alignment_length": healthy_hit["blast_alignment_length"],
+            })
         evidence.append(row)
 
-    write_filtered(args.out_mutation, mutation_rows, healthy_exact)
-    write_filtered(args.out_splicing, splicing_rows, healthy_exact)
+    write_filtered(args.out_mutation, mutation_rows, excluded)
+    write_filtered(args.out_splicing, splicing_rows, excluded)
     write_tsv(args.out_evidence, evidence, EVIDENCE_FIELDS)
 
 
@@ -114,11 +122,11 @@ def write_filtered(path: str, rows: list[dict[str, str]], excluded: set[str]) ->
 
 
 def empty_evidence(candidate: str, enabled: bool) -> dict[str, object]:
-    return {
+    row = {
         "candidate_peptide": candidate,
         "peptide_length": len(candidate),
         "PCI_DB_enabled": "true" if enabled else "false",
-        "healthy_exact_match": "false",
+        "healthy_blast_match": "false",
         "tumor_immune_peptide": "",
         "best_match_peptide": "",
         "blast_identity": "",
@@ -127,6 +135,7 @@ def empty_evidence(candidate: str, enabled: bool) -> dict[str, object]:
         "reference_hla_allele": "",
         "reference_disease_tissue": "",
     }
+    return {field: row.get(field, "") for field in EVIDENCE_FIELDS}
 
 
 def load_reference(path: str, lengths: set[int]) -> dict[int, list[dict[str, str]]]:
@@ -175,7 +184,7 @@ def run_blast_for_length(
 ) -> list[dict[str, str]]:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        db_fasta = tmp / "tumor.fa"
+        db_fasta = tmp / "reference.fa"
         query_fasta = tmp / "candidates.fa"
         db_fasta.write_text(
             "".join(f">ref_{idx}\n{row['peptide']}\n" for idx, row in enumerate(refs))
@@ -183,7 +192,7 @@ def run_blast_for_length(
         query_fasta.write_text(
             "".join(f">{query_id(seq)}\n{seq}\n" for seq in candidates)
         )
-        db_prefix = tmp / "tumor"
+        db_prefix = tmp / "reference"
         make = subprocess.run(
             [args.makeblastdb_cmd, "-in", str(db_fasta), "-dbtype", "prot", "-out", str(db_prefix)],
             text=True,
@@ -222,30 +231,43 @@ def run_blast_for_length(
         for line in blast.stdout.splitlines():
             fields = line.split("\t")
             if len(fields) != 8:
-                continue
+                raise SystemExit(f"Malformed BLAST row: expected 8 fields, got {len(fields)}")
             qseqid, sseqid, identity, align_len, _mismatch, _gapopen, evalue, bitscore = fields
             candidate = qmap.get(qseqid, "")
             try:
+                if not sseqid.startswith("ref_"):
+                    raise ValueError("invalid reference identifier")
                 ref_idx = int(sseqid.removeprefix("ref_"))
+                identity_value = float(identity)
+                evalue_value = float(evalue)
+                bitscore_value = float(bitscore)
+                alignment_length = int(align_len)
+                mismatch = int(_mismatch)
+                gapopen = int(_gapopen)
             except ValueError:
-                continue
+                raise SystemExit("Malformed BLAST row: invalid identifier or numeric value")
             if not candidate or ref_idx < 0 or ref_idx >= len(refs):
-                continue
+                raise SystemExit("Malformed BLAST row: unknown query or reference identifier")
             # Reference groups are already length-matched, but guard the parsed alignment too.
             ref = refs[ref_idx]
             if len(candidate) != len(ref["peptide"]):
-                continue
+                raise SystemExit("BLAST reference and query peptide lengths differ")
+            if (not all(math.isfinite(x) for x in (identity_value, evalue_value, bitscore_value))
+                    or not 0 <= identity_value <= 100 or evalue_value < 0 or bitscore_value < 0
+                    or not 1 <= alignment_length <= len(candidate) + len(ref["peptide"])
+                    or not 0 <= mismatch <= alignment_length or not 0 <= gapopen <= alignment_length):
+                raise SystemExit("Malformed BLAST row: numeric value out of range")
             rows.append(
                 {
                     "candidate_peptide": candidate,
                     "peptide_length": str(len(candidate)),
                     "PCI_DB_enabled": "true",
-                    "healthy_exact_match": "false",
                     "tumor_immune_peptide": ref["peptide"],
                     "best_match_peptide": ref["peptide"],
                     "blast_identity": identity,
                     "blast_evalue": evalue,
                     "blast_bit_score": bitscore,
+                    "blast_alignment_length": align_len,
                     "reference_hla_allele": ref.get("hla", ""),
                     "reference_disease_tissue": ref.get("disease", ""),
                 }

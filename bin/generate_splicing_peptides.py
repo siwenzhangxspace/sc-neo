@@ -195,7 +195,6 @@ def main() -> None:
     failures = Counter()
     output = []
     rejected = []
-    seen = set()
     try:
         for junction in read_tsv(args.junctions):
             uid = junction.get("uid") or junction.get("junction_id", "")
@@ -229,12 +228,7 @@ def main() -> None:
             for peptide in peptides:
                 evidences = support_phases.get(peptide["translation_frame"], [])
                 transcript_ids = sorted({item[1] for item in evidences})
-                key = (
-                    junction.get("patient_id", ""), uid, peptide["peptide"], peptide["translation_frame"]
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
+                # Keep every source record so patient aggregation retains all supporting cells.
                 tumor_cells = junction.get("junction_supporting_tumor_cell_ids", "")
                 normal_cells = junction.get("junction_supporting_normal_cell_ids", "")
                 output.append(

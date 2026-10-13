@@ -3,7 +3,7 @@ nextflow.enable.dsl = 2
 include { INPUT_VALIDATE_MANIFEST } from './modules/input'
 include { READS_PREPARE; ALIGN_READS } from './modules/reads'
 include { HLA_CALL; HLA_SUMMARIZE } from './modules/hla'
-include { VARIANT_CALL; VARIANT_FILTER_QUALITY; VARIANT_SELECT_RECURRENT; VARIANT_BUILD_CELL_EVIDENCE; VARIANT_TEST_ENRICHMENT } from './modules/variant_calling'
+include { VARIANT_CALL; VARIANT_FILTER_QUALITY; VARIANT_SELECT_RECURRENT; VARIANT_TEST_ENRICHMENT } from './modules/variant_calling'
 include { VARIANT_ANNOTATE; VARIANT_CONVERT_MAF; VARIANT_FILTER_SOMATIC } from './modules/variant_annotation'
 include { SPLICE_FILTER_MANIFEST; SPLICE_BUILD_MATRIX; SPLICE_NORMALIZE_MATRIX; SPLICE_FILTER_BACKGROUND } from './modules/splicing'
 include { PEPTIDE_GENERATE_MUTATION; PEPTIDE_GENERATE_SPLICING; PEPTIDE_COMPARE_IMMUNOPEPTIDOME; PEPTIDE_BYPASS_IMMUNOPEPTIDOME } from './modules/peptides'
@@ -87,7 +87,7 @@ workflow {
     hla_files = HLA_CALL.out.hla.map { _patient_id, hla -> hla }
     HLA_SUMMARIZE(manifest_valid, hla_files.collect())
 
-    // Recurrent tumor variants followed by tumor/normal callability and enrichment.
+    // Recurrent tumor variants followed by VCF-based tumor/normal enrichment.
     variant_aligned = aligned.filter { _patient_id, _cell_id, cell_type, _bam, _bai, _sj, _log, _qc ->
         cell_type == "tumor" || cell_type == "normal"
     }
@@ -96,20 +96,10 @@ workflow {
     scallele_vcfs = VARIANT_FILTER_QUALITY.out.vcf.map { _patient_id, _cell_id, _cell_type, vcf -> vcf }
 
     VARIANT_SELECT_RECURRENT(manifest_valid, scallele_vcfs.collect())
-    variant_bams = variant_aligned
-        .map { _patient_id, _cell_id, _cell_type, bam, bai, _sj, _log, _qc -> [bam, bai] }
-        .flatten()
-        .collect()
-    VARIANT_BUILD_CELL_EVIDENCE(
-        manifest_valid,
-        VARIANT_SELECT_RECURRENT.out.tsv,
-        variant_bams
-    )
     VARIANT_TEST_ENRICHMENT(
         manifest_valid,
         VARIANT_SELECT_RECURRENT.out.tsv,
-        scallele_vcfs.collect(),
-        VARIANT_BUILD_CELL_EVIDENCE.out.evidence
+        scallele_vcfs.collect()
     )
 
     VARIANT_ANNOTATE(
@@ -127,7 +117,13 @@ workflow {
         VARIANT_CONVERT_MAF.out.maf,
         VARIANT_TEST_ENRICHMENT.out.tsv
     )
-    PEPTIDE_GENERATE_MUTATION(VARIANT_FILTER_SOMATIC.out.maf)
+    PEPTIDE_GENERATE_MUTATION(
+        VARIANT_FILTER_SOMATIC.out.maf,
+        file(params.ref_protein_fasta),
+        file(params.ref_genome_fasta),
+        file("${params.ref_genome_fasta}.fai"),
+        file(params.ref_genome_gtf)
+    )
 
     // Alternative-splicing candidates and junction-spanning peptides.
     SPLICE_FILTER_MANIFEST(manifest_valid)
@@ -155,7 +151,7 @@ workflow {
         file(params.ref_splice_start_codon_table)
     )
 
-    // Optional immunopeptidome filtering/evidence. Healthy exact matches are removed;
+    // Optional immunopeptidome filtering/evidence. Same-length healthy BLAST hits with 100% identity are removed;
     // tumor-library matches are retained as evidence only.
     if (params.enable_immunopeptidome_compare) {
         PEPTIDE_COMPARE_IMMUNOPEPTIDOME(
@@ -249,7 +245,6 @@ workflow {
     vep_annotated_vcf = VARIANT_ANNOTATE.out.vcf
     vcf2maf_raw_maf = VARIANT_CONVERT_MAF.out.maf
     somatic_mutation_candidates_maf = VARIANT_FILTER_SOMATIC.out.maf
-    variant_cell_evidence = VARIANT_BUILD_CELL_EVIDENCE.out.evidence
 
     altanalyze_raw_junction_matrix = SPLICE_BUILD_MATRIX.out.raw_matrix
     altanalyze_groups = SPLICE_BUILD_MATRIX.out.groups
@@ -259,6 +254,7 @@ workflow {
     filtered_splice_junctions = SPLICE_FILTER_BACKGROUND.out.junctions
 
     mutation_peptides = PEPTIDE_GENERATE_MUTATION.out.peptides
+    rejected_mutation_variants = PEPTIDE_GENERATE_MUTATION.out.rejected
     splicing_peptides = PEPTIDE_GENERATE_SPLICING.out.peptides
     rejected_splicing_junctions = PEPTIDE_GENERATE_SPLICING.out.rejected
     immunopeptidome_filtered_mutation_peptides = mutation_peptides_for_mhc
@@ -358,11 +354,6 @@ output {
         mode params.output_publish_mode
         overwrite true
     }
-    variant_cell_evidence {
-        path '03_variants/deliverables'
-        mode params.output_publish_mode
-        overwrite true
-    }
 
     altanalyze_raw_junction_matrix {
         path '04_splicing/intermediate/matrix'
@@ -396,6 +387,11 @@ output {
     }
 
     mutation_peptides {
+        path '05_peptides/intermediate'
+        mode params.output_publish_mode
+        overwrite true
+    }
+    rejected_mutation_variants {
         path '05_peptides/intermediate'
         mode params.output_publish_mode
         overwrite true

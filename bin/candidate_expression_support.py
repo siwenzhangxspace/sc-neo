@@ -4,14 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import math
 from collections import defaultdict
 
-from scneo_utils import read_tsv, safe_float, split_list, write_tsv
+from scneo_utils import read_tsv, safe_float, write_tsv
+from candidate_utils import IDENTITY_FIELDS, grouped_candidates, supporting_cells
 
 
-KEY_FIELDS = ["patient_id", "source_type", "variant_or_junction_id", "peptide", "hla_allele"]
+KEY_FIELDS = IDENTITY_FIELDS
 EXPRESSION_FIELDS = KEY_FIELDS + [
-    "gene",
     "RNA_expression_support",
     "expression_mapping_status",
     "expression_supporting_cell_ids",
@@ -45,22 +46,31 @@ def attach_expression_support(
     for row in expression_rows:
         patient = row.get("patient_id", "")
         cell = row.get("cell_id", "")
-        value = safe_float(row.get("normalized_expression"), 0.0) or 0.0
+        value = safe_float(row.get("normalized_expression"), None)
         gene_name = (row.get("gene_name") or "").strip()
         gene_id = (row.get("gene_id") or "").split(".")[0]
         patient_cells[patient].add(cell)
+        if value is None or not math.isfinite(value):
+            continue
         if gene_name:
-            by_name[(patient, cell, gene_name.upper())] = value
+            key = (patient, cell, gene_name.upper())
+            if key in by_name and by_name[key] != value:
+                raise ValueError(f"Conflicting expression for gene name {key}")
+            by_name[key] = value
             patient_gene_names[patient].add(gene_name.upper())
         if gene_id:
-            by_id[(patient, cell, gene_id.upper())] = value
+            key = (patient, cell, gene_id.upper())
+            if key in by_id and by_id[key] != value:
+                raise ValueError(f"Conflicting expression for gene ID {key}")
+            by_id[key] = value
             patient_gene_ids[patient].add(gene_id.upper())
 
     out = []
-    for pmhc in pmhc_rows:
+    for group in grouped_candidates(pmhc_rows).values():
+        pmhc = group[0]
         patient = pmhc.get("patient_id", "")
         gene = (pmhc.get("gene") or "").strip()
-        supporting = split_list(pmhc.get("supporting_tumor_cell_ids", ""))
+        supporting = supporting_cells(group)
         present_cells = [cell for cell in supporting if cell in patient_cells.get(patient, set())]
         missing_cells = [cell for cell in supporting if cell not in patient_cells.get(patient, set())]
 
@@ -94,10 +104,12 @@ def attach_expression_support(
                         scored_cells.append(cell)
             if values:
                 score = f"{max(values):.10g}"
+                missing_cells = sorted(set(supporting) - set(scored_cells))
                 status = "ok" if not missing_cells else "partial_cells_missing"
             else:
                 status = "gene_not_mapped_in_supporting_cells"
 
+        missing_cells = sorted(set(supporting) - set(scored_cells))
         row = {field: pmhc.get(field, "") for field in KEY_FIELDS}
         row.update(
             {
