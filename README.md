@@ -4,7 +4,7 @@
 
 `sc-neo` is a Nextflow DSL2 workflow for discovering and prioritizing neoantigen candidates from Smart-seq2 single-cell transcriptomes. It combines RNA-sequencing evidence from each patient's tumor cells, normal cells, and T cells to identify peptides arising from somatic variants and aberrant splicing, then evaluates them using HLA-I presentation, expression, immunogenicity, and TCR-recognition evidence.
 
-![Overview of sc-neo antigen sources, TCR matching, and candidate prioritization](sc-neo-workflow-overview.png)
+![Overview of sc-neo antigen sources, TCR matching, and candidate prioritization](scneo_workflow.png)
 
 *Figure 1. The workflow links tumor-cell antigen sources with T-cell TCRs within each patient, then ranks neoantigen candidates using evidence from multiple dimensions.*
 
