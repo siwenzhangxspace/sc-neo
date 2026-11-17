@@ -20,6 +20,7 @@ OUTPUT_COLUMNS = [
     "alpha_chain_detected",
     "alpha_beta_tcell",
     "trust4_status",
+    "tcell_subtype",
 ]
 INVALID_CDR3_AA_MARKERS = {"?", "_", "*"}
 
@@ -42,12 +43,14 @@ def main() -> None:
 
     rows = []
     for meta in manifest_rows:
-        if meta["cell_type"] != "tcell":
+        subtype = meta.get("tcell_subtype", "").strip().upper()
+        if meta["cell_type"] != "tcell" or (subtype and not subtype.startswith("CD8")):
             continue
         cell_id = meta["cell_id"]
         if cell_id in report_rows_by_cell:
             parsed = parse_report(report_rows_by_cell[cell_id])
-            parsed.update({"patient_id": meta["patient_id"], "cell_id": cell_id})
+            parsed.update({"patient_id": meta["patient_id"], "cell_id": cell_id,
+                           "tcell_subtype": meta.get("tcell_subtype", "")})
             rows.append(parsed)
         else:
             rows.append(

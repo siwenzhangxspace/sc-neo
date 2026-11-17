@@ -238,12 +238,12 @@ P001	Normal_001	normal	/data/P001/Normal_001_R1.fastq.gz	/data/P001/Normal_001_R
 P001	Tcell_001	tcell	/data/P001/Tcell_001_R1.fastq.gz	/data/P001/Tcell_001_R2.fastq.gz
 ```
 
-- `cell_type` must be `tumor`, `normal`, or `tcell`. Each `cell_id` must be globally unique and must not contain a period (`.`).
+- `cell_type` must be `tumor`, `normal`, or `tcell`. `tcell` rows must represent tumor CD8 cells unless an optional `tcell_subtype` column identifies CD8 rows. Each `cell_id` must be globally unique and must not contain a period (`.`).
 - The `fastq_2` column must be present. By default, `allow_single_end_reads = true`, so leave its value empty for single-end data. The workflow infers read layout from whether this value is empty.
-- Each patient must have at least three cells of each type by default. Adjust `threshold_min_cells_per_type` to change this minimum.
+- Each patient must have the configured minimum number of tumor and normal cells. Matched T cells may be absent.
 - Tumor and normal reads from the same patient must use the same layout. All T-cell reads in a TRUST4 batch must also use the same layout.
 
-The three rows above illustrate the format only; a run with the default minimum requires at least three tumor, three normal, and three T cells per patient. Use one FASTQ path per read column rather than comma-separated lane lists.
+The three rows above illustrate the format only; a run with the default minimum requires at least three tumor and three normal cells per patient; matched tumor CD8 T cells are optional. Use one FASTQ path per read column rather than comma-separated lane lists.
 
 ### Run the workflow
 
@@ -260,7 +260,7 @@ nextflow run main.nf \
   -resume
 ```
 
-Set `CONTAINER_RUNTIME` to either `apptainer` or `singularity`; the executable and Nextflow profile then match. The `docker` and `conda` profiles are also available with their respective setup. Single-end reads are allowed by default; fastp trimming and immunopeptidome comparison are disabled by default. To resume an interrupted run, use the same inputs and configuration with `-resume`. For cluster execution, override the executor and resources in your site config.
+Set `CONTAINER_RUNTIME` to either `apptainer` or `singularity`; the executable and Nextflow profile then match. The `docker` and `conda` profiles are also available with their respective setup. Single-end reads are allowed by default. Fastp trimming is disabled; immunopeptidome comparison is enabled by default. To resume an interrupted run, use the same inputs and configuration with `-resume`. For cluster execution, override the executor and resources in your site config.
 
 Commonly adjusted parameters are listed below. See [`nextflow.config`](nextflow.config) for all defaults.
 
@@ -270,7 +270,7 @@ Commonly adjusted parameters are listed below. See [`nextflow.config`](nextflow.
 | `output_publish_mode` | `copy` | Nextflow output publishing mode. |
 | `enable_read_trimming` | `false` | Run fastp read trimming. |
 | `allow_single_end_reads` | `true` | Allow an empty `fastq_2` value. |
-| `threshold_min_cells_per_type` | `3` | Minimum cells of each type per patient. |
+| `threshold_min_cells_per_type` | `3` | Minimum tumor and normal cells per patient. |
 | `threshold_min_tumor_variant_cells` | `3` | Minimum tumor cells supporting a recurrent variant. |
 | `threshold_variant_enrichment_fdr` | `0.1` | FDR threshold for tumor/normal variant enrichment. |
 | `threshold_population_af_max` | `0.001` | Maximum population allele frequency. |
@@ -279,7 +279,10 @@ Commonly adjusted parameters are listed below. See [`nextflow.config`](nextflow.
 | `threshold_splice_min_reads` | `3` | Minimum reads supporting a splicing event. |
 | `threshold_mhc_affinity_max` | `150` | netMHCpan `Aff.nM` limit; the filter uses a strict less-than comparison. |
 | `threshold_mhc_rank_el_max` | `2` | netMHCpan `rank_EL` limit; the filter uses a strict less-than comparison. |
-| `enable_immunopeptidome_compare` | `false` | Compare peptides with healthy and tumor immunopeptidome references. |
+| `input_gene_tpm` | `null` | Optional long TSV with unlogged malignant-cell TPM; see docs/scoring.md. |
+| `enable_tcr_recognition` | `true` | Set false for the predefined four-module model without TCR. |
+| `scoring_rna_reference_tpm` | `198.738794605166` | Fixed RNA reference shared with the current benchmark. |
+| `enable_immunopeptidome_compare` | `true` | Compare peptides with healthy and tumor immunopeptidome references. |
 | `enable_strict_splice_phase` | `false` | Keep only splicing translation frames supported by phase evidence. |
 | `enable_splice_exclude_documented_junctions` | `false` | Exclude splicing events recorded in the transcript table. |
 
@@ -359,10 +362,13 @@ The Nextflow work directory defaults to `work/`. It stores task cache files used
 | Symptom | Checks |
 | --- | --- |
 | Missing `--input_manifest` or `ref_*` parameter | Pass the manifest on the command line and configure all required reference resources in `conf/local.config`. |
-| Manifest validation reports missing columns, missing FASTQ files, or too few cells | Confirm the file is tab-separated, required column names are exact, and FASTQ paths are readable. Check that each patient has enough `tumor`, `normal`, and `tcell` rows. |
+| Manifest validation reports missing columns, missing FASTQ files, or too few cells | Confirm the file is tab-separated, required column names are exact, and FASTQ paths are readable. Check that each patient has enough `tumor` and `normal` rows; matched CD8 T cells are optional. |
 | `mixed read layouts` or a TRUST4 layout error | Check that `fastq_2` is consistently populated or empty across tumor and normal cells for each patient, and that all T cells use the same single-end or paired-end layout. |
 | A container image cannot be found | Check that `runtime_container_dir` points to the directory containing the required `.sif` files, especially `s5_latest.sif`, `vep.sif`, `trust4.sif`, and `tabr-bert.sif`. |
 | `command not found` or an external model fails to start | Check whether the relevant `tool_*_cmd` points to an executable visible inside the task container. Install and mount licensed tools, models, and references as required. |
 | FASTQ or reference files are missing inside a container | Confirm bind mounts cover the manifest paths, references, work directory, output directory, and image directory. Prefer absolute paths that are identical inside and outside the container. |
 | A task fails without enough detail in the Nextflow summary | Inspect `.nextflow.log` and the task's `work/<task-hash>/.command.err` and `.command.log` files to identify the failing process and external command. |
 | A task exits after running out of memory or CPU | Adjust the resources associated with process labels in `conf/local.config` for your executor. Default resources and concurrency limits are defined in `nextflow.config`. |
+## Evidence scoring
+
+See [the scoring specification](docs/scoring.md) for module formulas, fixed weights, missing-evidence rules, per-cell TPM input, and cohort-wide top-10% selection. Run `python bin/test_scoring.py` for scoring regression tests. After upgrading from the previous scoring implementation, use new work and output directories for the first run; older cached evidence does not include the required TPM, allele-mask and alignment-coverage fields.

@@ -15,6 +15,8 @@ NUMERIC_FIELDS = frozenset({
     "healthy_blast_identity", "healthy_blast_evalue", "healthy_blast_alignment_length",
     "blast_identity", "blast_evalue", "max_TABR_BERT_rank", "RNA_expression_support",
     "peptide_length", "n_original_rows", "n_barcode",
+    "query_coverage", "blast_alignment_length", "blast_bit_score", "mean_malignant_TPM",
+    "malignant_cells", "expression_measured_cells", "expression_detected_cells",
 })
 
 
@@ -108,3 +110,10 @@ def evidence_index(rows, key_function, fields):
     for row in rows:
         groups[key_function(row)].append(row)
     return {key: consistent_row(group, fields, key) for key, group in groups.items()}
+
+def peptide_hla_key(row):
+    peptide = clean(row.get("peptide") or row.get("peptide_sequence") or row.get("peptide_seq"))
+    allele = clean(row.get("hla_allele") or row.get("HLA_allele")).upper().replace("*", "").replace(":", "")
+    if allele and not allele.startswith(("HLA-", "H-2-")):
+        allele = "HLA-" + allele
+    return peptide, allele

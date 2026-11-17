@@ -76,6 +76,7 @@ process CANDIDATE_TOPSIS {
     """
     ${params.tool_python_cmd} ${workflow.projectDir}/bin/score_candidates_topsis.py \
         --candidates ${candidates} \
+        --rna-reference ${params.scoring_rna_reference_tpm} \
         --out final_candidate_neoantigens.tsv
     """
 }

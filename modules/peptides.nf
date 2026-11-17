@@ -4,17 +4,25 @@ process PEPTIDE_GENERATE_MUTATION {
 
     input:
     path maf
+    path protein_fasta
+    path genome_fasta
+    path genome_fasta_fai
+    path reference_gtf
 
     output:
     path "mutation_peptides.tsv", emit: peptides
+    path "rejected_mutation_variants.tsv", emit: rejected
 
     script:
     """
     ${params.tool_python_cmd} ${workflow.projectDir}/bin/generate_mutation_peptides.py \
         --maf ${maf} \
-        --protein-fasta ${params.ref_protein_fasta} \
+        --protein-fasta ${protein_fasta} \
+        --genome-fasta ${genome_fasta} \
+        --reference-gtf ${reference_gtf} \
         --lengths ${params.peptide_class_i_lengths} \
-        --out mutation_peptides.tsv
+        --out mutation_peptides.tsv \
+        --rejected-out rejected_mutation_variants.tsv
     """
 }
 

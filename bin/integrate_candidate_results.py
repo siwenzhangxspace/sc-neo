@@ -10,9 +10,16 @@ from pathlib import Path
 from scneo_utils import read_tsv, write_tsv
 from candidate_utils import (
     candidate_key, clean, consistent_row, evidence_index,
-    grouped_candidates, supporting_cells,
+    grouped_candidates, supporting_cells, peptide_hla_key,
 )
 
+
+from compare_immunopeptidome import EVIDENCE_FIELDS
+from candidate_expression_support import EXPRESSION_FIELDS
+from candidate_utils import IDENTITY_FIELDS
+
+IMMUNE_FIELDS = [f for f in EVIDENCE_FIELDS if f not in {"candidate_peptide", "peptide_length"}]
+RNA_FIELDS = EXPRESSION_FIELDS[len(IDENTITY_FIELDS):]
 
 FINAL_FIELDS = [
     "patient_id",
@@ -54,6 +61,7 @@ FINAL_FIELDS = [
     "tumor_specific_candidate",
     "tumor_enriched_candidate",
 ]
+FINAL_FIELDS += [field for field in [*IMMUNE_FIELDS, *RNA_FIELDS, "iedb_mask_rule", "tabr_bert_status"] if field not in FINAL_FIELDS]
 
 
 def main() -> None:
@@ -77,17 +85,17 @@ def main() -> None:
     if args.immunopeptidome:
         immunopeptidome = evidence_index(
             read_tsv(args.immunopeptidome), lambda row: clean(row.get("candidate_peptide")),
-            FINAL_FIELDS[FINAL_FIELDS.index("PCI_DB_enabled"):FINAL_FIELDS.index("max_TABR_BERT_rank")],
+            IMMUNE_FIELDS,
         )
     elif args.pcidb:
         immunopeptidome = legacy_pcidb_evidence(read_tsv(args.pcidb))
     else:
         immunopeptidome = {}
     tabr = evidence_index(read_tsv(args.tabr), tabr_key,
-                          ["max_TABR_BERT_rank", "best_tcr_cell_id", "best_cdr3_beta_aa"])
+                          ["max_TABR_BERT_rank", "best_tcr_cell_id", "best_cdr3_beta_aa", "tabr_bert_status"])
     expression = (
         evidence_index(read_tsv(args.expression), candidate_key,
-                       ["RNA_expression_support", "expression_mapping_status"])
+                       RNA_FIELDS)
         if args.expression
         else {}
     )
@@ -121,8 +129,14 @@ def main() -> None:
             or pmhc.get("variant_class", "")
         )
         variant_status = "somatic_candidate" if legacy_status == "tumor_variant" else legacy_status
-        iedb_row = iedb.get(peptide, {})
+        iedb_row = iedb.get(peptide_hla_key(pmhc), iedb.get((peptide, ""), {}))
         immune_row = immunopeptidome.get(peptide, {})
+        if (args.immunopeptidome or args.pcidb) and peptide not in immunopeptidome:
+            raise ValueError(f"Missing PCI evidence row for peptide {peptide}; regenerate evidence")
+        if not iedb_row:
+            raise ValueError(f"Missing IEDB evidence for {peptide_hla_key(pmhc)}")
+        if tabr_key(pmhc) not in tabr:
+            raise ValueError(f"Missing TCR evidence row for {tabr_key(pmhc)}; regenerate prediction")
         tabr_row = tabr.get(tabr_key(pmhc), {})
         if args.expression and key not in expression:
             raise ValueError(f"Missing expression evidence row for key7 {key!r}; regenerate expression support")
@@ -130,6 +144,10 @@ def main() -> None:
 
         final_rows.append(
             {
+                **immune_row,
+                **expression_row,
+                "iedb_mask_rule": iedb_row.get("iedb_mask_rule", ""),
+                "tabr_bert_status": tabr_row.get("tabr_bert_status", ""),
                 "patient_id": pmhc.get("patient_id", ""),
                 "patient_status": patient_status.get(pmhc.get("patient_id", ""), ""),
                 "source_type": pmhc.get("source_type", ""),
@@ -255,7 +273,7 @@ def tabr_key(row: dict[str, str]) -> tuple[str, str, str]:
 
 
 def index_iedb(rows):
-    return evidence_index(rows, lambda row: clean(row.get("peptide")), ["immunogenicity_score"])
+    return evidence_index(rows, peptide_hla_key, ["immunogenicity_score", "iedb_mask_rule"])
 
 
 def legacy_pcidb_evidence(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:

@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 
 from scneo_utils import split_list, write_tsv
 
 
-FIELDS = ["patient_id", "cell_id", "gene_id", "gene_name", "raw_count"]
+FIELDS = ["patient_id", "cell_id", "gene_id", "gene_name", "raw_count", "gene_length"]
 
 
 def main() -> None:
@@ -32,6 +33,8 @@ def parse_featurecounts(path: str, patient_id: str, cell_ids: list[str]) -> list
         fieldnames = reader.fieldnames or []
         if not fieldnames:
             return []
+        if "Length" not in fieldnames:
+            raise ValueError("featureCounts output requires Length for TPM calculation")
         if "Geneid" not in fieldnames:
             raise ValueError("featureCounts output is missing Geneid")
 
@@ -46,12 +49,17 @@ def parse_featurecounts(path: str, patient_id: str, cell_ids: list[str]) -> list
         for record in reader:
             gene_id = (record.get("Geneid") or "").split(".")[0]
             gene_name = record.get("gene_name") or gene_id
+            length = float(record["Length"])
+            if not math.isfinite(length) or length <= 0:
+                raise ValueError(f"Invalid gene length for {gene_id}")
             for cell_id, column in zip(cell_ids, count_columns):
                 value = record.get(column, "0")
                 try:
-                    count = int(float(value or 0))
-                except ValueError:
-                    count = 0
+                    count = float(value)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid count for {gene_id}/{cell_id}") from exc
+                if not math.isfinite(count) or count < 0:
+                    raise ValueError(f"Invalid count for {gene_id}/{cell_id}")
                 rows.append(
                     {
                         "patient_id": patient_id,
@@ -59,6 +67,7 @@ def parse_featurecounts(path: str, patient_id: str, cell_ids: list[str]) -> list
                         "gene_id": gene_id,
                         "gene_name": gene_name,
                         "raw_count": count,
+                        "gene_length": length,
                     }
                 )
         return rows

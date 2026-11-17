@@ -1,127 +1,87 @@
 #!/usr/bin/env python3
-"""Attach candidate-level RNA expression support from supporting tumor cells."""
+"""Attach mean source-gene TPM across every sampled malignant cell of a patient."""
 
 from __future__ import annotations
-
 import argparse
 import math
 from collections import defaultdict
+from scneo_utils import read_tsv, write_tsv
+from candidate_utils import IDENTITY_FIELDS, grouped_candidates
 
-from scneo_utils import read_tsv, safe_float, write_tsv
-from candidate_utils import IDENTITY_FIELDS, grouped_candidates, supporting_cells
-
-
-KEY_FIELDS = IDENTITY_FIELDS
-EXPRESSION_FIELDS = KEY_FIELDS + [
-    "RNA_expression_support",
-    "expression_mapping_status",
-    "expression_supporting_cell_ids",
-    "expression_missing_cell_ids",
+EXPRESSION_FIELDS = IDENTITY_FIELDS + [
+    "RNA_expression_support", "mean_malignant_TPM", "expression_unit", "expression_source",
+    "malignant_cells", "expression_measured_cells", "expression_detected_cells",
+    "expression_mapping_status", "expression_supporting_cell_ids", "expression_missing_cell_ids",
 ]
 
 
-def main() -> None:
+def attach_expression_support(pmhc_rows, expression_rows, manifest=None):
+    patients = defaultdict(set)
+    if manifest is not None:
+        for row in manifest:
+            if row["cell_type"] == "tumor":
+                patients[row["patient_id"]].add(row["cell_id"])
+    by_name, by_id = defaultdict(dict), defaultdict(dict)
+    sources = defaultdict(set)
+    for row in expression_rows:
+        patient, cell = row["patient_id"], row["cell_id"]
+        if manifest is not None and cell not in patients[patient]:
+            raise ValueError(f"Expression cell outside the malignant-cell manifest {patient}/{cell}")
+        patients[patient].add(cell)
+        if "tpm" not in row:
+            raise ValueError("Expression needs unlogged tpm. Regenerate or supply measured TPM.")
+        sources[patient].add(row.get("expression_source", "supplied_gene_TPM"))
+        value = row["tpm"]
+        if value in ("", None):
+            continue
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"Invalid TPM for {patient}/{cell}")
+        identifiers = [(by_name, row.get("gene_name", "").upper()),
+                       (by_id, row.get("gene_id", "").split(".")[0].upper())]
+        for index, gene in identifiers:
+            if gene:
+                values = index[(patient, gene)]
+                if cell in values and values[cell] != value:
+                    raise ValueError(f"Ambiguous expression mapping {patient}/{cell}/{gene}")
+                values[cell] = value
+    out = []
+    for group in grouped_candidates(pmhc_rows).values():
+        candidate = group[0]
+        patient, gene = candidate["patient_id"], candidate["gene"].upper()
+        cells = patients[patient]
+        measured = by_name.get((patient, gene), by_id.get((patient, gene), {}))
+        missing = cells - measured.keys()
+        value = ""
+        status = "gene_not_mapped"
+        if not cells:
+            status = "malignant_cells_missing"
+        elif measured:
+            status = "incomplete_gene_measurement" if missing else "ok"
+            if not missing:
+                value = format(math.fsum(measured[cell] for cell in sorted(cells)) / len(cells), ".17g")
+        row = {field: candidate.get(field, "") for field in IDENTITY_FIELDS}
+        row.update({
+            "RNA_expression_support": value, "mean_malignant_TPM": value, "expression_unit": "TPM",
+            "expression_source": ";".join(sorted(sources[patient])), "malignant_cells": len(cells),
+            "expression_measured_cells": len(measured), "expression_detected_cells": sum(v > 0 for v in measured.values()),
+            "expression_mapping_status": status, "expression_supporting_cell_ids": ",".join(sorted(measured)),
+            "expression_missing_cell_ids": ",".join(sorted(missing)),
+        })
+        out.append(row)
+    return out
+
+
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pmhc", required=True)
     parser.add_argument("--expression", required=True)
+    parser.add_argument("--manifest")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-
-    pmhc = read_tsv(args.pmhc)
-    expression = read_tsv(args.expression)
-    rows = attach_expression_support(pmhc, expression)
+    rows = attach_expression_support(read_tsv(args.pmhc), read_tsv(args.expression),
+                                     read_tsv(args.manifest) if args.manifest else None)
     write_tsv(args.out, rows, EXPRESSION_FIELDS)
-
-
-def attach_expression_support(
-    pmhc_rows: list[dict[str, str]],
-    expression_rows: list[dict[str, str]],
-) -> list[dict[str, object]]:
-    by_name: dict[tuple[str, str, str], float] = {}
-    by_id: dict[tuple[str, str, str], float] = {}
-    patient_cells: dict[str, set[str]] = defaultdict(set)
-    patient_gene_names: dict[str, set[str]] = defaultdict(set)
-    patient_gene_ids: dict[str, set[str]] = defaultdict(set)
-
-    for row in expression_rows:
-        patient = row.get("patient_id", "")
-        cell = row.get("cell_id", "")
-        value = safe_float(row.get("normalized_expression"), None)
-        gene_name = (row.get("gene_name") or "").strip()
-        gene_id = (row.get("gene_id") or "").split(".")[0]
-        patient_cells[patient].add(cell)
-        if value is None or not math.isfinite(value):
-            continue
-        if gene_name:
-            key = (patient, cell, gene_name.upper())
-            if key in by_name and by_name[key] != value:
-                raise ValueError(f"Conflicting expression for gene name {key}")
-            by_name[key] = value
-            patient_gene_names[patient].add(gene_name.upper())
-        if gene_id:
-            key = (patient, cell, gene_id.upper())
-            if key in by_id and by_id[key] != value:
-                raise ValueError(f"Conflicting expression for gene ID {key}")
-            by_id[key] = value
-            patient_gene_ids[patient].add(gene_id.upper())
-
-    out = []
-    for group in grouped_candidates(pmhc_rows).values():
-        pmhc = group[0]
-        patient = pmhc.get("patient_id", "")
-        gene = (pmhc.get("gene") or "").strip()
-        supporting = supporting_cells(group)
-        present_cells = [cell for cell in supporting if cell in patient_cells.get(patient, set())]
-        missing_cells = [cell for cell in supporting if cell not in patient_cells.get(patient, set())]
-
-        gene_key = gene.upper()
-        use_name = bool(gene_key and gene_key in patient_gene_names.get(patient, set()))
-        use_id = bool(gene_key and gene_key in patient_gene_ids.get(patient, set()))
-        status = "ok"
-        score: object = ""
-        scored_cells: list[str] = []
-
-        if not gene:
-            status = "gene_missing"
-        elif not use_name and not use_id:
-            status = "gene_not_mapped"
-        elif not supporting:
-            status = "supporting_cells_missing"
-        elif not present_cells:
-            status = "supporting_cells_not_quantified"
-        else:
-            values = []
-            for cell in present_cells:
-                if use_name:
-                    key = (patient, cell, gene_key)
-                    if key in by_name:
-                        values.append(by_name[key])
-                        scored_cells.append(cell)
-                else:
-                    key = (patient, cell, gene_key)
-                    if key in by_id:
-                        values.append(by_id[key])
-                        scored_cells.append(cell)
-            if values:
-                score = f"{max(values):.10g}"
-                missing_cells = sorted(set(supporting) - set(scored_cells))
-                status = "ok" if not missing_cells else "partial_cells_missing"
-            else:
-                status = "gene_not_mapped_in_supporting_cells"
-
-        missing_cells = sorted(set(supporting) - set(scored_cells))
-        row = {field: pmhc.get(field, "") for field in KEY_FIELDS}
-        row.update(
-            {
-                "gene": gene,
-                "RNA_expression_support": score,
-                "expression_mapping_status": status,
-                "expression_supporting_cell_ids": ",".join(scored_cells),
-                "expression_missing_cell_ids": ",".join(missing_cells),
-            }
-        )
-        out.append(row)
-    return out
 
 
 if __name__ == "__main__":

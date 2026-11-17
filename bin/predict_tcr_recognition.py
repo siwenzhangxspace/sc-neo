@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import shlex
 import subprocess
 import tempfile
@@ -27,7 +28,7 @@ OUTPUT_FIELDS = [
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pmhc", required=True)
-    parser.add_argument("--tcr", required=True)
+    parser.add_argument("--tcr")
     parser.add_argument("--cmd", default="tabr_bert_predict")
     parser.add_argument("--extra-args", default="")
     parser.add_argument("--out", required=True)
@@ -36,8 +37,9 @@ def main() -> None:
     pmhc_rows = unique_candidates(read_tsv(args.pmhc))
     tcr_rows = [
         row
-        for row in read_tsv(args.tcr)
+        for row in (read_tsv(args.tcr) if args.tcr else [])
         if row.get("trust4_status") == "ok" and row.get("cdr3_beta_aa")
+        and (not row.get("tcell_subtype") or row["tcell_subtype"].strip().upper().startswith("CD8"))
     ]
     tcr_by_patient: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in tcr_rows:
@@ -61,6 +63,8 @@ def main() -> None:
     for combo in combos:
         value = scores.get(score_key(combo))
         numeric = safe_float(value, None)
+        if numeric is None or not math.isfinite(numeric) or not 0 <= numeric <= 1:
+            raise ValueError(f"Missing or invalid TABR-BERT rank for {score_key(combo)}")
         if numeric is not None:
             grouped_scores[candidate_key(combo)].append((numeric, combo))
 
@@ -76,7 +80,7 @@ def main() -> None:
                     "patient_id": key[0],
                     "peptide": key[1],
                     "hla_allele": key[2],
-                    "max_TABR_BERT_rank": f"{rank:.10g}",
+                    "max_TABR_BERT_rank": f"{rank:.17g}",
                     "best_tcr_cell_id": best.get("tcr_cell_id", ""),
                     "best_cdr3_beta_aa": best.get("cdr3_beta_aa", ""),
                     "tabr_bert_status": "ok",
@@ -140,7 +144,10 @@ def run_wrapper(cmd: str, extra_args: str, combos: list[dict[str, str]]) -> dict
         )
         if value == "":
             continue
-        scores[score_key(row)] = value
+        key = score_key(row)
+        if key in scores and float(scores[key]) != float(value):
+            raise ValueError(f"Conflicting TABR-BERT ranks for {key}")
+        scores[key] = value
     return scores
 
 

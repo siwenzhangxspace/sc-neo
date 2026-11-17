@@ -47,6 +47,7 @@ process EXPRESSION_NORMALIZE {
     path "tumor_gene_counts.tsv", emit: raw_matrix
     path "tumor_expression_normalized.tsv", emit: normalized
     path "tumor_expression_matrix.tsv", emit: normalized_matrix
+    path "tumor_gene_tpm_matrix.tsv", emit: tpm_matrix
 
     script:
     def countArgs = counts.collect { file -> file }.join(' ')
@@ -55,7 +56,8 @@ process EXPRESSION_NORMALIZE {
         --counts ${countArgs} \
         --out-long tumor_expression_normalized.tsv \
         --out-raw-matrix tumor_gene_counts.tsv \
-        --out-normalized-matrix tumor_expression_matrix.tsv
+        --out-normalized-matrix tumor_expression_matrix.tsv \
+        --out-tpm-matrix tumor_gene_tpm_matrix.tsv
     """
 }
 
@@ -66,6 +68,7 @@ process CANDIDATE_EXPRESSION_SUPPORT {
     input:
     path pmhc
     path expression
+    path manifest
 
     output:
     path "candidate_expression_support.tsv", emit: support
@@ -75,6 +78,31 @@ process CANDIDATE_EXPRESSION_SUPPORT {
     ${params.tool_python_cmd} ${workflow.projectDir}/bin/candidate_expression_support.py \
         --pmhc ${pmhc} \
         --expression ${expression} \
+        --manifest ${manifest} \
         --out candidate_expression_support.tsv
+    """
+}
+
+process EXPRESSION_IMPORT_TPM {
+    tag "supplied_gene_tpm"
+    label "utility_light"
+
+    input:
+    path gene_tpm
+
+    output:
+    path "tumor_gene_counts.tsv", emit: raw_matrix
+    path "tumor_expression_normalized.tsv", emit: normalized
+    path "tumor_expression_matrix.tsv", emit: normalized_matrix
+    path "tumor_gene_tpm_matrix.tsv", emit: tpm_matrix
+
+    script:
+    """
+    ${params.tool_python_cmd} ${workflow.projectDir}/bin/normalize_expression.py \
+        --tpm ${gene_tpm} \
+        --out-long tumor_expression_normalized.tsv \
+        --out-raw-matrix tumor_gene_counts.tsv \
+        --out-normalized-matrix tumor_expression_matrix.tsv \
+        --out-tpm-matrix tumor_gene_tpm_matrix.tsv
     """
 }

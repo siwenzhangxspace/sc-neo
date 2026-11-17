@@ -9,7 +9,7 @@ include { SPLICE_FILTER_MANIFEST; SPLICE_BUILD_MATRIX; SPLICE_NORMALIZE_MATRIX; 
 include { PEPTIDE_GENERATE_MUTATION; PEPTIDE_GENERATE_SPLICING; PEPTIDE_COMPARE_IMMUNOPEPTIDOME; PEPTIDE_BYPASS_IMMUNOPEPTIDOME } from './modules/peptides'
 include { MHC_PREDICT_MUTATION; MHC_PREDICT_SPLICING; MHC_MERGE_BATCHES; MHC_FILTER_CANDIDATES } from './modules/mhc'
 include { TCR_ASSEMBLE; TCR_PARSE_CDR3 } from './modules/tcr'
-include { EXPRESSION_QUANTIFY; EXPRESSION_NORMALIZE; CANDIDATE_EXPRESSION_SUPPORT } from './modules/expression'
+include { EXPRESSION_QUANTIFY; EXPRESSION_NORMALIZE; EXPRESSION_IMPORT_TPM; CANDIDATE_EXPRESSION_SUPPORT } from './modules/expression'
 include { PREDICT_IMMUNOGENICITY; PREDICT_TCR_RECOGNITION } from './modules/scoring'
 include { CANDIDATE_INTEGRATE; CANDIDATE_TOPSIS } from './modules/results'
 
@@ -40,10 +40,13 @@ workflow {
         "ref_vep_cache_dir",
         "ref_dbsnp_vcf",
         "ref_cosmic_vcf",
-        "ref_trust4_sequence",
-        "ref_trust4_imgt",
         "ref_immunogenicity_script",
     ].each { it -> requireParam(it) }
+
+    if (params.enable_tcr_recognition) {
+        requireParam("ref_trust4_sequence")
+        requireParam("ref_trust4_imgt")
+    }
 
     if (params.enable_immunopeptidome_compare) {
         requireParam("ref_immunopeptidome_healthy_tsv")
@@ -99,7 +102,8 @@ workflow {
     VARIANT_TEST_ENRICHMENT(
         manifest_valid,
         VARIANT_SELECT_RECURRENT.out.tsv,
-        scallele_vcfs.collect()
+        scallele_vcfs.collect(),
+        []  // Keep the existing VCF-based enrichment; no BAM callability input.
     )
 
     VARIANT_ANNOTATE(
@@ -151,8 +155,7 @@ workflow {
         file(params.ref_splice_start_codon_table)
     )
 
-    // Optional immunopeptidome filtering/evidence. Same-length healthy BLAST hits with 100% identity are removed;
-    // tumor-library matches are retained as evidence only.
+    // Healthy full-length exact peptides are excluded; tumor similarity is retained as evidence.
     if (params.enable_immunopeptidome_compare) {
         PEPTIDE_COMPARE_IMMUNOPEPTIDOME(
             PEPTIDE_GENERATE_MUTATION.out.peptides,
@@ -182,33 +185,47 @@ workflow {
         MHC_PREDICT_SPLICING.out.predictions
     )
 
-    // TCR beta reconstruction. parse_trust4.py keeps the highest-count valid TRB CDR3 per T cell.
-    tcell_reads = reads.filter { _patient_id, _cell_id, cell_type, _read_layout, _read_files, _fastp_json ->
-        cell_type == "tcell"
+    // tcell rows represent tumor CD8 cells unless an explicit subtype selects them.
+    if (params.enable_tcr_recognition) {
+        cd8_cells = manifest_valid.splitCsv(header: true, sep: "\t")
+            .filter { row -> row.cell_type == "tcell" && (!row.tcell_subtype || row.tcell_subtype.toUpperCase().startsWith("CD8")) }
+            .map { row -> tuple(row.cell_id, true) }
+        tcell_fastqs = reads
+            .filter { _patient_id, _cell_id, cell_type, _layout, _files, _qc -> cell_type == "tcell" }
+            .map { _patient_id, cell_id, _type, _layout, files, _qc -> tuple(cell_id, files) }
+            .join(cd8_cells)
+            .map { _cell_id, files, _selected -> files }
+            .collect().filter { files -> !files.isEmpty() }
+        TCR_ASSEMBLE(tcell_fastqs, file(params.ref_trust4_sequence), file(params.ref_trust4_imgt))
+        trust_reports = TCR_ASSEMBLE.out.report.collect().ifEmpty([])
+        trust4_raw = TCR_ASSEMBLE.out.raw.map { report, annot -> [report, annot] }
+    } else {
+        trust_reports = channel.value([])
+        trust4_raw = channel.empty()
     }
-    tcell_fastqs = tcell_reads
-        .map { _patient_id, _cell_id, _cell_type, _read_layout, read_files, _fastp_json -> read_files }
-        .collect()
-    TCR_ASSEMBLE(
-        tcell_fastqs,
-        file(params.ref_trust4_sequence),
-        file(params.ref_trust4_imgt)
-    )
-    trust_reports = TCR_ASSEMBLE.out.report
-    trust4_raw = TCR_ASSEMBLE.out.raw.map { report, annot -> [report, annot] }
-    TCR_PARSE_CDR3(manifest_valid, trust_reports.collect())
+    TCR_PARSE_CDR3(manifest_valid, trust_reports)
 
-    // Tumor-cell gene expression from the coordinate-sorted BAMs.
-    tumor_expression_input = aligned
-        .filter { _patient_id, _cell_id, cell_type, _bam, _bai, _sj, _log, _qc -> cell_type == "tumor" }
-        .map { patient_id, cell_id, _cell_type, bam, bai, _sj, _log, _qc ->
-            tuple(patient_id, cell_id, bam, bai)
-        }
-    EXPRESSION_QUANTIFY(tumor_expression_input, file(params.ref_genome_gtf))
-    EXPRESSION_NORMALIZE(EXPRESSION_QUANTIFY.out.counts.collect())
+    if (params.input_gene_tpm) {
+        EXPRESSION_IMPORT_TPM(file(params.input_gene_tpm))
+        expression_normalized = EXPRESSION_IMPORT_TPM.out.normalized
+        expression_matrix = EXPRESSION_IMPORT_TPM.out.normalized_matrix
+        expression_tpm_matrix = EXPRESSION_IMPORT_TPM.out.tpm_matrix
+        expression_counts = EXPRESSION_IMPORT_TPM.out.raw_matrix
+        expression_raw = channel.empty()
+    } else {
+        tumor_expression_input = aligned
+            .filter { _patient_id, _cell_id, cell_type, _bam, _bai, _sj, _log, _qc -> cell_type == "tumor" }
+            .map { patient_id, cell_id, _type, bam, bai, _sj, _log, _qc -> tuple(patient_id, cell_id, bam, bai) }
+        EXPRESSION_QUANTIFY(tumor_expression_input, file(params.ref_genome_gtf))
+        EXPRESSION_NORMALIZE(EXPRESSION_QUANTIFY.out.counts.collect())
+        expression_normalized = EXPRESSION_NORMALIZE.out.normalized
+        expression_matrix = EXPRESSION_NORMALIZE.out.normalized_matrix
+        expression_tpm_matrix = EXPRESSION_NORMALIZE.out.tpm_matrix
+        expression_counts = EXPRESSION_NORMALIZE.out.raw_matrix
+        expression_raw = EXPRESSION_QUANTIFY.out.raw
+    }
     CANDIDATE_EXPRESSION_SUPPORT(
-        MHC_FILTER_CANDIDATES.out.pmhc,
-        EXPRESSION_NORMALIZE.out.normalized
+        MHC_FILTER_CANDIDATES.out.pmhc, expression_normalized, manifest_valid
     )
 
     // Candidate-level scoring evidence.
@@ -272,10 +289,11 @@ workflow {
     trust4_raw = trust4_raw
     tcr_beta_cdr3 = TCR_PARSE_CDR3.out.tcr
 
-    expression_featurecounts_raw = EXPRESSION_QUANTIFY.out.raw
-    tumor_gene_counts = EXPRESSION_NORMALIZE.out.raw_matrix
-    tumor_expression_normalized = EXPRESSION_NORMALIZE.out.normalized
-    tumor_expression_matrix = EXPRESSION_NORMALIZE.out.normalized_matrix
+    expression_featurecounts_raw = expression_raw
+    tumor_gene_counts = expression_counts
+    tumor_expression_normalized = expression_normalized
+    tumor_expression_matrix = expression_matrix
+    tumor_gene_tpm_matrix = expression_tpm_matrix
     candidate_expression_support = CANDIDATE_EXPRESSION_SUPPORT.out.support
 
     tabr_bert_predictions = PREDICT_TCR_RECOGNITION.out.tabr
@@ -475,6 +493,11 @@ output {
         overwrite true
     }
     tumor_expression_normalized {
+        path '08_scoring/deliverables/expression'
+        mode params.output_publish_mode
+        overwrite true
+    }
+    tumor_gene_tpm_matrix {
         path '08_scoring/deliverables/expression'
         mode params.output_publish_mode
         overwrite true

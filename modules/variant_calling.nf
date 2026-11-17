@@ -74,12 +74,13 @@ process VARIANT_TEST_ENRICHMENT {
 
     script:
     def inputVcfs = vcfs instanceof List ? vcfs.join(" ") : vcfs
+    def evidenceArgs = evidence ? "--evidence ${evidence}" : ""
     """
     ${params.tool_python_cmd} ${workflow.projectDir}/bin/test_variant_enrichment.py \\
         --manifest ${input_manifest} \\
         --recurrent-tsv ${recurrent_tsv} \\
         --vcfs ${inputVcfs} \\
-        --evidence ${evidence} \\
+        ${evidenceArgs} \\
         --fdr ${params.threshold_variant_enrichment_fdr} \\
         --out-tsv tumor_enrichment.tsv \\
         --out-vcf tumor_enriched_variants.vcf
@@ -113,4 +114,3 @@ process VARIANT_BUILD_CELL_EVIDENCE {
         --out variant_cell_evidence.tsv
     """
 }
-

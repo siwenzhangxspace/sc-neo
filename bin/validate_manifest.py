@@ -12,7 +12,7 @@ from scneo_utils import die, read_tsv, write_tsv
 
 ALLOWED_CELL_TYPES = {"tumor", "normal", "tcell"}
 REQUIRED = ["patient_id", "cell_id", "cell_type", "fastq_1", "fastq_2"]
-OUTPUT_COLUMNS = REQUIRED + ["read_layout"]
+OUTPUT_COLUMNS = REQUIRED + ["read_layout", "tcell_subtype"]
 
 
 def main() -> None:
@@ -73,6 +73,7 @@ def main() -> None:
                 "patient_id": patient_id,
                 "cell_id": cell_id,
                 "cell_type": cell_type,
+                "tcell_subtype": cleaned.get("tcell_subtype", ""),
                 "fastq_1": str(Path(cleaned.get("fastq_1", "")).resolve()) if cleaned.get("fastq_1") else "",
                 "fastq_2": str(Path(cleaned.get("fastq_2", "")).resolve()) if cleaned.get("fastq_2") else "",
                 "read_layout": "paired" if cleaned.get("fastq_2") else "single",
@@ -80,7 +81,7 @@ def main() -> None:
         )
 
     for patient_id, patient_count in sorted(patient_counts.items()):
-        for cell_type in sorted(ALLOWED_CELL_TYPES):
+        for cell_type in ["normal", "tumor"]:
             if patient_count[cell_type] < args.min_cells_per_type:
                 errors.append(
                     f"patient {patient_id} has {patient_count[cell_type]} {cell_type} cells; "
@@ -104,7 +105,7 @@ def main() -> None:
         }
         row["patient_status"] = (
             "ok"
-            if all(row[f"{ct}_cells"] >= args.min_cells_per_type for ct in ["tumor", "normal", "tcell"])
+            if all(row[f"{ct}_cells"] >= args.min_cells_per_type for ct in ["tumor", "normal"])
             else "insufficient_cells"
         )
         summary_rows.append(row)
